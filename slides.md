@@ -22,6 +22,7 @@ overviewSnapshots: true
 # Learn KVM
 深度探索 Linux 系统虚拟化：原理与实现（王柏生 谢广军 著）
 
+[视频教程 - 泽文(Chao Liu)](https://www.bilibili.com/video/BV1MyyHYbEPa)
 
 <div class="pt-12">
   <span @click="$slidev.nav.next" class="px-2 py-1 rounded cursor-pointer" hover="bg-white bg-opacity-10">
