@@ -1,11 +1,7 @@
-# Welcome to [Slidev](https://github.com/slidevjs/slidev)!
+# Learn KVM
 
-To start the slide show:
+本系列视频，记录 up 主学习虚拟化技术的过程。
 
-- `npm install`
-- `npm run dev`
-- visit <http://localhost:3030>
+配套教材：深度探索 Linux 系统虚拟化：原理与实现（王柏生 谢广军 著）
 
-Edit the [slides.md](./slides.md) to see the changes.
-
-Learn more about Slidev at the [documentation](https://sli.dev/).
+获取 PPT / 进交流群，请 ➕ VX：zevorn
