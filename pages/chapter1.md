@@ -537,3 +537,344 @@ void kvm_inject_page_fault(struct kvm_vcpu *vcpu, …)
     "je 2f \n\t"
     "mov %%"R"ax, %%cr2 \n\t"
 ```
+---
+layout: cover
+---
+
+# 1.3 陷入和模拟
+
+<br>
+从 Host 的角度来说，VM 就是 Host 的一个进程。一个 Host 上的多个 VM 与 Host 共享系统的资源。
+
+因此，当访问系统资源时，就需要退出到 Host 模式，由 Host 作为统一的管理者代为完成资源访问。
+
+<br>
+需要陷入 Host 和模拟的情况：
+
+ - Guest 主动陷入 Host：比如虚拟机访问 I/O
+
+ - Guest 被动陷入 Host: 比如遇到特殊指令，或者遇到外部中断
+
+
+---
+
+## 1.3.1 访问外设
+
+<br>
+
+常用的访问外设方式包括 PIO（programmed I/O）和 MMIO（memory-mapped I/O）。
+
+在这一节，我们重点探讨 MMIO ，然后简单地介绍一下 PIO ，
+
+更多内容将在“设备虚拟化”一章中讨论。
+
+---
+
+### 1. MMIO
+
+MMIO 是 PCI 规范的一部分，I/O 设备被映射到内存地址空间而不是 I/O 空间。
+
+以 MMIO 方式访问外设时不使用专用的访问外设的指令（out、outs、in、ins），是一种隐式的 I/O 访
+问。
+
+> PS: 由于这些映射的地址空间是留给外设的，因此 CPU 将产生页面异常，从而触发虚拟机退出，陷入 VMM 中。
+
+以 LAPIC 为例：
+
+```c
+linux-1.3.31/arch/i386/kernel/smp.c
+void smp_boot_cpus(void)
+{
+    …
+    apic_reg = vremap(0xFEE00000,4096);
+    …
+}
+linux-1.3.31/include/asm-i386/i82489.h
+#define APIC_ICR 0x300
+linux-1.3.31/include/asm-i386/smp.h
+extern __inline void apic_write(unsigned long reg,unsigned long v)
+{
+    *((unsigned long *)(apic_reg+reg))=v;
+}
+```
+
+---
+
+此时访问 icr 寄存器就像访问普通内存一样了，写 icr 寄存器的代码如下所示：
+
+```c
+linux-1.3.31/arch/i386/kernel/smp.c
+void smp_boot_cpus(void)
+{
+    …
+    apic_write(APIC_ICR, cfg); /* Kick the second */
+    …
+}
+```
+
+当 Guest 执行这条指令时：
+
+```c {*}{maxHeight:'220px'}
+commit 97222cc8316328965851ed28d23f6b64b4c912d2
+KVM: Emulate local APIC in kernel
+linux.git/drivers/kvm/vmx.c
+static int handle_exception(struct kvm_vcpu *vcpu, …)
+{
+    …
+    if (is_page_fault(intr_info)) {
+        …
+        r = kvm_mmu_page_fault(vcpu, cr2, error_code);
+        …
+        if (!r) {
+            …
+            return 1;
+        }
+        er = emulate_instruction(vcpu, kvm_run, cr2, error_code);
+        …
+    }
+    …
+}
+```
+
+---
+
+x86 指令格式
+
+```
++---------------+----------+----------+-------+----------------+-------------+
+|               |          |          |       |                |             |
+|  insn prefix  |  opcode  |  ModR/M  |  SIB  |  displacement  |  immediate  |
+|               |          |          |       |                |             |
++---------------+----------+----------+-------+----------------+-------------+
+```
+
+- insn prefix: rep, lock, repne, ...
+
+- opcode: 1-3 bytes
+
+- ModR/M: 1 byte
+
+- displacement: 表示偏移
+
+- immediate: 表示立即数
+
+---
+
+我们以下面的代码片段为例，看一下编译器将 MMIO 访问翻译的汇编指令：
+
+```c
+// test.c
+char *icr_reg;
+void write() {
+    *((unsigned long *)icr_reg) = 123;
+}
+```
+
+我们将上述代码片段编译为汇编指令：`gcc -S test.c`
+
+核心汇编指令如下：
+
+```asm
+// test.s
+    movq icr_reg(%rip), %rax
+    movq $123, (%rax)
+```
+
+可见，这段 MMIO 访问被编译器翻译为 mov 指令，源操作数是立即数，
+
+目的操作数 icr_reg（%rip）相当于 icr 寄存器映射到内存地址空间中的内存地址。
+
+---
+
+KVM 中模拟指令的入口函数是 emulate_instruction，其核心部分在函数 x86_emulate_memop 中:
+
+```c {*}{maxHeight:'400px'}
+commit 97222cc8316328965851ed28d23f6b64b4c912d2
+KVM: Emulate local APIC in kernel
+linux.git/drivers/kvm/x86_emulate.c
+01 int x86_emulate_memop(struct x86_emulate_ctxt *ctxt, …)
+02 {
+03     unsigned d;
+04     u8 b, sib, twobyte = 0, rex_prefix = 0;
+05     …
+06     for (i = 0; i < 8; i++) {
+07         switch (b = insn_fetch(u8, 1, _eip)) {
+08     …
+09     d = opcode_table[b];
+10     …
+11     if (d & ModRM) {
+12         modrm = insn_fetch(u8, 1, _eip);
+13         modrm_mod |= (modrm & 0xc0) >> 6;
+14         …
+15     }
+16     …
+17     switch (d & SrcMask) {
+18     …
+19     case SrcImm:
+20         src.type = OP_IMM;
+21         src.ptr = (unsigned long *)_eip;
+22         src.bytes = (d & ByteOp) ? 1 : op_bytes;
+23         …
+24         switch (src.bytes) {
+25             case 1:
+26             src.val = insn_fetch(s8, 1, _eip);
+27             break;
+28             …
+29     }
+30     …
+31     switch (d & DstMask) {
+32         …
+33     case DstMem:
+34         dst.type = OP_MEM;
+35         dst.ptr = (unsigned long *)cr2;
+36         dst.bytes = (d & ByteOp) ? 1 : op_bytes;
+37         …
+38     }
+39     …
+40     switch (b) {
+41     …
+42     case 0x88 ... 0x8b: /* mov */
+43     case 0xc6 ... 0xc7: /* mov (sole member of Grp11) */
+44         dst.val = src.val;
+45         break;
+46     …
+47     }
+48 
+49     writeback:
+50     if (!no_wb) {
+51         switch (dst.type) {
+52         …
+53         case OP_MEM:
+54             …
+56                 rc = ops->write_emulated((unsigned long)dst.ptr,
+57                              &dst.val, dst.bytes,
+58                              ctxt->vcpu);
+59      …
+60      ctxt->vcpu->rip = _eip;
+61      …
+62 }
+```
+
+---
+
+写寄存器的操作可能会伴随一些副作用，需要设备做些额外的操作：
+
+```c
+commit c5ec153402b6d276fe20029da1059ba42a4b55e5
+KVM: enable in-kernel APIC INIT/SIPI handling
+linux.git/drivers/kvm/kvm_main.c
+int emulator_write_emulated(unsigned long addr, const void *val,…)
+{
+    …
+    return emulator_write_emulated_onepage(addr, val, …);
+}
+
+static int emulator_write_emulated_onepage(unsigned long addr,…)
+{
+    …
+    mmio_dev = vcpu_find_mmio_dev(vcpu, gpa);
+    if (mmio_dev) {
+        kvm_iodevice_write(mmio_dev, gpa, bytes, val);
+        return X86EMUL_CONTINUE;
+    }
+    …
+}
+```
+
+---
+
+对于 LAPIC 模拟设备，这个函数是 apic_mmio_write:
+
+```c {*}{maxHeight:'100px'}
+commit c5ec153402b6d276fe20029da1059ba42a4b55e5
+KVM: enable in-kernel APIC INIT/SIPI handling
+linux.git/drivers/kvm/lapic.c
+static void apic_mmio_write(struct kvm_io_device *this, …)
+{
+    …
+    case APIC_ICR:
+    …
+    apic_send_ipi(apic);
+    …
+}
+```
+
+鉴于 LAPIC 的寄存器的访问非常频繁，所以 Intel 从硬件层面做了很多支持:
+
+```c
+commit f78e0e2ee498e8f847500b565792c7d7634dcf54
+KVM: VMX: Enable memory mapped TPR shadow (FlexPriority)
+linux.git/drivers/kvm/vmx.c
+static int (*kvm_vmx_exit_handlers[])(…) = {
+    …
+    [EXIT_REASON_APIC_ACCESS] =
+    handle_apic_access,
+};
+static int handle_apic_access(struct kvm_vcpu *vcpu, …)
+{
+    …
+    er = emulate_instruction(vcpu, kvm_run, 0, 0, 0);
+    …
+}
+```
+
+---
+
+### 2. PIO
+
+PIO 使用专用的 I/O 指令（out、outs、in、ins）访问外设，当 Guest 通过这些专门的 I/O 指令访问外设时，
+处于 Guest 模式的 CPU 将主动发生陷入，进入 VMM 。
+
+Intel PIO 指令支持两种模式:
+
+- 普通的 I/O: 一次传递 1 个值，对应于 x86 架构的指令 out、in
+- string I/O: 一次传递多个值，对应于 x86 架构的指令 outs、ins
+
+<br>
+
+因此，对于普通的 I/O ，只需要记录下 val ，而对于 string I/O ，则需要记录下 I/O 值所在的地址。
+
+---
+
+我们以向块设备写数据为例，对于普通的 I/O ，其使用的是 out 指令:
+
+|指令|描述|
+| --- | --- |
+| OUT imm8, AL | 将 AL 寄存器的值写入 imm8 指定的端口 |
+| OUT imm8, AX | 将 AX 寄存器的值写入 imm8 指定的端口 |
+| OUT imm8, EAX | 将 EAX 寄存器的值写入 imm8 指定的端口 |
+| OUT DX, AL | 将 AL 寄存器的值写入 DX 寄存器中记录的 I/O 端口 |
+| OUT DX, AX | 将 AX 寄存器的值写入 DX 寄存器中记录的 I/O 端口 |
+| OUT DX, EAX | 将 EAX 寄存器的值写入 DX 寄存器中记录的 I/O 端口 |
+
+<br>
+
+> 可以看到，无论哪种格式，out 指令的源操作数都是寄存器 al、ax、eax 系列。
+
+---
+
+因此，当陷入 KVM 模块时，KVM 模块可以从 Guest 的 rax 寄存器的值中取出 Guest 准备写给外设的值，
+KVM 将这个值存储到结构体 kvm_run 中。
+
+```c
+commit 6aa8b732ca01c3d7a54e93f4d701b8aabbe60fb7
+[PATCH] kvm: userspace interface
+linux.git/drivers/kvm/vmx.c
+static int handle_io(struct kvm_vcpu *vcpu, …)
+{
+    …
+    if (kvm_run->io.string) {
+        …
+        kvm_run->io.address =
+        vmcs_readl(GUEST_LINEAR_ADDRESS);
+    } else
+        kvm_run->io.value = vcpu->regs[VCPU_REGS_RAX]; /* rax */
+    return 0;
+}
+```
+
+对于 string 类型的 I/O ，需要记录的是数据所在的内存地址，
+
+这个地址在陷入 KVM 前，CPU 会将其记录在 VMCS 的字段 GUEST_LINEAR_ADDRESS 中，
+
+KVM 将这个值从 VMCS 中读出来，存储到结构体 kvm_run 中
